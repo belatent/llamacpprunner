@@ -41,6 +41,10 @@ QGroupBox QLabel {
     color: #a1a1aa;
 }
 
+QGroupBox QCheckBox {
+    color: #a1a1aa;
+}
+
 /* ---------- Input Widgets ---------- */
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     border: 1px solid #3f3f46;
@@ -62,7 +66,7 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabl
     border-color: #27272a;
 }
 
-QPlainTextEdit {
+QPlainTextEdit, QTextEdit {
     border: 1px solid #3f3f46;
     border-radius: 6px;
     padding: 6px 8px;
@@ -71,7 +75,7 @@ QPlainTextEdit {
     selection-background-color: #4f46e5;
 }
 
-QPlainTextEdit:focus {
+QPlainTextEdit:focus, QTextEdit:focus {
     border-color: #6366f1;
 }
 
@@ -164,11 +168,13 @@ QPushButton[flat="true"], QPushButton#themeToggleBtn {
     background: transparent;
     border: 1px solid #3f3f46;
     color: #a1a1aa;
+    padding: 2px;
 }
 
 QPushButton[flat="true"]:hover, QPushButton#themeToggleBtn:hover {
     background: #27272a;
     color: #fafafa;
+    padding: 2px;
 }
 
 /* ---------- Start/Stop Toggle Button ---------- */
@@ -412,4 +418,35 @@ QMenu::item {
 
 QMenu::item:selected {
     background: #27272a;
+}
+
+/* ---------- RPC Node Chip ---------- */
+QWidget#RpcNodeChip {
+    background: #1e1b4b;
+    border: 1px solid #4c1d95;
+    border-radius: 6px;
+}
+
+QWidget#RpcNodeChip QLabel {
+    color: #c4b5fd;
+    font-size: 12px;
+    background: transparent;
+    border: none;
+}
+
+QPushButton#RpcChipDeleteBtn {
+    background: transparent;
+    border: none;
+    color: #7c3aed;
+    padding: 0px;
+    font-size: 15px;
+    font-weight: bold;
+    min-height: 0px;
+}
+
+QPushButton#RpcChipDeleteBtn:hover {
+    color: #a78bfa;
+    background: transparent;
+    border: none;
+    padding: 0px;
 }

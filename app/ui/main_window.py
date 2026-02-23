@@ -105,8 +105,9 @@ class MainWindow(QMainWindow):
         self._webui_url: str = ""
         self.open_webui_btn.clicked.connect(self._open_webui)
 
-        self.load_btn = QPushButton("加载配置")
-        self.save_btn = QPushButton("保存配置")
+        self.load_btn = QPushButton("打开...")
+        self.save_btn = QPushButton("保存")
+        self.save_as_btn = QPushButton("另存为")
 
         self.profile_combo = QComboBox()
         self.profile_combo.setEditable(False)
@@ -132,6 +133,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addWidget(self.load_btn)
         toolbar.addWidget(self.save_btn)
+        toolbar.addWidget(self.save_as_btn)
         toolbar.addSeparator()
         toolbar.addWidget(QLabel("配置目录"))
         toolbar.addWidget(self.config_dir_edit)
@@ -146,6 +148,7 @@ class MainWindow(QMainWindow):
         self.params_panel.config_changed.connect(self._on_config_changed)
         self.load_btn.clicked.connect(self._load_profile_dialog)
         self.save_btn.clicked.connect(self._save_profile_dialog)
+        self.save_as_btn.clicked.connect(self._save_as_profile_dialog)
         self.start_stop_btn.clicked.connect(self._toggle_process)
         self.profile_combo.currentTextChanged.connect(self._load_profile_by_name)
         self.theme_toggle_btn.clicked.connect(self._toggle_theme)
@@ -256,6 +259,18 @@ class MainWindow(QMainWindow):
         self._refresh_profiles()
         self.profile_combo.setCurrentText(profile_name)
         self.status_text.setText(f"配置已保存：{profile_name}")
+
+    def _save_as_profile_dialog(self) -> None:
+        current_name = self.profile_combo.currentText().strip()
+        suggested = f"{current_name} 副本" if current_name else ""
+        name, ok = QInputDialog.getText(self, "另存为", "请输入新配置方案名称：", text=suggested)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        self.profile_store.save_profile(name, self._current_config())
+        self._refresh_profiles()
+        self.profile_combo.setCurrentText(name)
+        self.status_text.setText(f"配置已另存为：{name}")
 
     def _load_profile_by_name(self, profile_name: str) -> None:
         if not profile_name:
