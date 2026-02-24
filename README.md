@@ -14,12 +14,9 @@
 ## 运行
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m pip show PySide6
-python -m app.main
+uv venv
+uv pip install -r requirements.txt
+uv run python -m app.main
 ```
 
 ## 绿色打包（便携版）

@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFontDatabase, QFontMetrics, QTextCursor
+from PySide6.QtGui import QFontDatabase, QTextCursor, QTextOption
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -14,14 +14,76 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QLineEdit,
+    QSizePolicy,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 MAX_BLOCK_COUNT = 10_000
 FLUSH_INTERVAL_MS = 50
-PREVIEW_MAX_HEIGHT = 200
 PREVIEW_MIN_HEIGHT = 38
+
+
+class _AutoHeightTextEdit(QTextEdit):
+    """QTextEdit that auto-adjusts fixed height to fit all content, pushing log area down.
+
+    Uses QTextEdit (not QPlainTextEdit) because its document().size() correctly
+    accounts for word-wrap after setTextWidth(), making height calculation reliable.
+    WrapAnywhere is set so that long paths without spaces also wrap at the widget edge.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.setWordWrapMode(QTextOption.WrapAnywhere)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFixedHeight(PREVIEW_MIN_HEIGHT)
+
+        # Debounce timer: only recalculate after resize events settle
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(30)
+        self._resize_timer.timeout.connect(self._adjust_height)
+
+        self.document().contentsChanged.connect(self._schedule_adjust)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Debounce rapid resize events (e.g. splitter drag) so height is
+        # recalculated only once the viewport width has stabilised.
+        self._resize_timer.start()
+
+    def _schedule_adjust(self) -> None:
+        QTimer.singleShot(0, self._adjust_height)
+
+    def _adjust_height(self) -> None:
+        vw = self.viewport().width()
+        if vw <= 0:
+            return
+        doc = self.document()
+        doc.setTextWidth(vw)
+
+        last_block = doc.lastBlock()
+        layout = doc.documentLayout()
+        if not last_block.text() and last_block.blockNumber() > 0:
+            # blockBoundingRect(last_block).top() == topMargin + all-content-height.
+            # Using this as the viewport target means the trailing empty block never
+            # enters the visible area. We add one documentMargin as bottom padding
+            # so content doesn't appear flush against the frame border.
+            h = int(layout.blockBoundingRect(last_block).top()) + int(doc.documentMargin())
+        else:
+            h = int(doc.size().height())
+
+        # Measure the actual frame/border overhead dynamically so the formula is
+        # correct across platforms and themes, without a hard-coded fudge factor.
+        overhead = self.height() - self.viewport().height()
+        if overhead <= 0:
+            overhead = self.frameWidth() * 2
+
+        self.setFixedHeight(max(PREVIEW_MIN_HEIGHT, h + overhead))
 
 
 class LogPanel(QWidget):
@@ -32,7 +94,6 @@ class LogPanel(QWidget):
         self._pending: list[str] = []
         self._pending_partial: str = ""
         self._displayed_partial: str = ""
-        self._preview_visible = False
         self._build_ui()
 
         self._flush_timer = QTimer(self)
@@ -52,25 +113,15 @@ class LogPanel(QWidget):
         self.output_edit.setReadOnly(True)
         fixed_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
         self.output_edit.setFont(fixed_font)
-        self.output_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.output_edit.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.output_edit.setMaximumBlockCount(MAX_BLOCK_COUNT)
 
         root.addWidget(self.output_edit, 1)
 
     def _build_command_preview(self, parent_layout: QVBoxLayout) -> None:
-        self.preview_toggle_btn = QPushButton("命令预览 ▼")
-        self.preview_toggle_btn.setProperty("flat", True)
-        self.preview_toggle_btn.clicked.connect(self._toggle_preview)
-
-        self.preview_edit = QPlainTextEdit()
-        self.preview_edit.setReadOnly(True)
-        self.preview_edit.setLineWrapMode(QPlainTextEdit.WidgetWidth)
-        self.preview_edit.setVisible(False)
-        self.preview_edit.setMaximumHeight(PREVIEW_MAX_HEIGHT)
-        self.preview_edit.setMinimumHeight(0)
-        self.preview_edit.document().contentsChanged.connect(self._adjust_preview_height)
-
-        parent_layout.addWidget(self.preview_toggle_btn, 0, Qt.AlignLeft)
+        preview_label = QLabel("命令预览")
+        self.preview_edit = _AutoHeightTextEdit()
+        parent_layout.addWidget(preview_label)
         parent_layout.addWidget(self.preview_edit)
 
     def _build_toolbar(self, parent_layout: QVBoxLayout) -> None:
@@ -95,37 +146,6 @@ class LogPanel(QWidget):
 
     def set_command_preview(self, text: str) -> None:
         self.preview_edit.setPlainText(text)
-
-    def _toggle_preview(self) -> None:
-        self._preview_visible = not self._preview_visible
-        self.preview_edit.setVisible(self._preview_visible)
-        self.preview_toggle_btn.setText(
-            "命令预览 ▲" if self._preview_visible else "命令预览 ▼"
-        )
-        if self._preview_visible:
-            self._adjust_preview_height()
-
-    def _adjust_preview_height(self) -> None:
-        if not self._preview_visible:
-            return
-        doc = self.preview_edit.document()
-        font = self.preview_edit.font()
-        fm = QFontMetrics(font)
-        line_height = fm.lineSpacing()
-        block_count = doc.blockCount()
-
-        # account for wrapped lines by checking document layout
-        layout_height = int(doc.size().height())
-        margins = self.preview_edit.contentsMargins()
-        frame_width = self.preview_edit.frameWidth() * 2
-        padding = margins.top() + margins.bottom() + frame_width + 8
-
-        # use the larger of block-based or layout-based estimate
-        block_based = block_count * line_height + padding
-        layout_based = layout_height + padding
-        desired = max(block_based, layout_based)
-        clamped = max(PREVIEW_MIN_HEIGHT, min(desired, PREVIEW_MAX_HEIGHT))
-        self.preview_edit.setFixedHeight(clamped)
 
     def append_line(self, line: str, is_error: bool = False) -> None:
         prefix = datetime.now().strftime("%H:%M:%S")
