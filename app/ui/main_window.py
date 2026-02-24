@@ -41,7 +41,7 @@ class MainWindow(QMainWindow):
         self.theme_mgr = theme_mgr
         self.setWindowTitle("llama.cpp 启动器")
         self.resize(1440, 860)
-        self.setMinimumSize(1000, 500)
+        self.setMinimumSize(1280, 600)
 
         self._build_ui()
         self._bind_events()
@@ -58,7 +58,7 @@ class MainWindow(QMainWindow):
         self.log_panel = LogPanel()
 
         left_container = QWidget()
-        left_container.setMinimumWidth(540)
+        left_container.setMinimumWidth(810)
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(8, 8, 4, 8)
         left_layout.setSpacing(8)
@@ -74,9 +74,9 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.log_panel)
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
-        splitter.setStretchFactor(0, 35)
-        splitter.setStretchFactor(1, 65)
-        splitter.setSizes([520, 920])
+        splitter.setStretchFactor(0, 45)
+        splitter.setStretchFactor(1, 55)
+        splitter.setSizes([810, 630])
         root.addWidget(splitter, 1)
 
         self.setCentralWidget(central)

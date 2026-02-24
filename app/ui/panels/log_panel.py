@@ -113,7 +113,7 @@ class LogPanel(QWidget):
         self.output_edit.setReadOnly(True)
         fixed_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
         self.output_edit.setFont(fixed_font)
-        self.output_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.output_edit.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.output_edit.setMaximumBlockCount(MAX_BLOCK_COUNT)
 
         root.addWidget(self.output_edit, 1)

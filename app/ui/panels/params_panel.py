@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, QThread, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -268,6 +268,7 @@ class _RpcNodeList(QWidget):
         h = self._flow.heightForWidth(self.width()) if self._flow.count() > 0 else 0
         if self.height() != h:
             self.setFixedHeight(h)
+            self.updateGeometry()
 
     def hasHeightForWidth(self) -> bool:
         return True
@@ -288,8 +289,9 @@ class _RpcNodeList(QWidget):
         chip.setProperty("node_text", text)
         chip.delete_requested.connect(self._remove_chip)
         self._flow.addWidget(chip)
-        self._sync_height()
-        self.updateGeometry()
+        # Defer height sync by one event-loop iteration so Qt has time to
+        # polish the new chip widget and produce an accurate sizeHint().
+        QTimer.singleShot(0, self._sync_height)
         self.changed.emit()
 
     def _remove_chip(self, text: str) -> None:
@@ -300,8 +302,7 @@ class _RpcNodeList(QWidget):
                 if w:
                     w.hide()
                     w.deleteLater()
-                self._sync_height()
-                self.updateGeometry()
+                QTimer.singleShot(0, self._sync_height)
                 self.changed.emit()
                 return
 
@@ -720,7 +721,7 @@ class ParamsPanel(QWidget):
         adv_checks_layout.addWidget(gpu_split_cell, 1, 2)
         adv_checks_layout.setColumnStretch(0, 1)
         adv_checks_layout.setColumnStretch(1, 1)
-        adv_checks_layout.setColumnStretch(2, 1)
+        adv_checks_layout.setColumnStretch(2, 2)
         adv_layout.addWidget(adv_checks)
 
         # 推测解码（可折叠）
@@ -956,16 +957,11 @@ class ParamsPanel(QWidget):
         self.ctx_custom_check.setEnabled(checked)
         self.ctx_slider.setEnabled(checked and not custom_on)
         self.ctx_edit.setEnabled(checked and custom_on)
-        self.fit_ctx_check.setEnabled(checked)
-        fit_ctx_active = checked and self.fit_ctx_check.isChecked()
-        self.fit_ctx_edit.setEnabled(fit_ctx_active)
-        self.fit_target_edit.setEnabled(fit_ctx_active)
         self._update_fit_ctx_style()
 
     def _on_fit_ctx_toggled(self, checked: bool) -> None:
-        active = checked and self.ctx_enabled_check.isChecked()
-        self.fit_ctx_edit.setEnabled(active)
-        self.fit_target_edit.setEnabled(active)
+        self.fit_ctx_edit.setEnabled(checked)
+        self.fit_target_edit.setEnabled(checked)
         if not checked:
             self.fit_ctx_edit.setStyleSheet("")
         self._update_fit_ctx_style()
@@ -974,7 +970,7 @@ class ParamsPanel(QWidget):
         self._update_fit_ctx_style()
 
     def _update_fit_ctx_style(self) -> None:
-        if self.fit_ctx_check.isChecked() and self.ctx_enabled_check.isChecked() and not self.fit_ctx_edit.text().strip():
+        if self.fit_ctx_check.isChecked() and not self.fit_ctx_edit.text().strip():
             self.fit_ctx_edit.setStyleSheet("border: 1px solid red;")
         else:
             self.fit_ctx_edit.setStyleSheet("")

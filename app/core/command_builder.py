@@ -99,10 +99,23 @@ def build_command(config: LlamaConfig) -> list[str]:
                 command.extend(["--spec-ngram-min-hits", str(config.spec_ngram_min_hits)])
 
     if config.custom_args_enabled and config.custom_args.strip():
-        command.extend(shlex.split(config.custom_args, posix=False))
+        command.extend(shlex.split(config.custom_args))
 
     return command
 
 
 def build_command_preview(config: LlamaConfig) -> str:
-    return subprocess.list2cmdline(build_command(config))
+    """Return a human-readable command string.
+
+    Custom args are appended verbatim so that quotes entered by the user
+    are preserved in the preview instead of being lost through
+    shlex.split → list2cmdline round-tripping.
+    """
+    base_command = build_command(config)
+    # Remove the already-split custom args from the list so we can re-append
+    # the raw string, preserving the user's original quoting.
+    if config.custom_args_enabled and config.custom_args.strip():
+        extra = shlex.split(config.custom_args)
+        base_command = base_command[: len(base_command) - len(extra)]
+        return subprocess.list2cmdline(base_command) + " " + config.custom_args.strip()
+    return subprocess.list2cmdline(base_command)
