@@ -147,6 +147,7 @@ class _FlowLayout(QLayout):
 
     def addItem(self, item: QLayoutItem) -> None:
         self._items.append(item)
+        self.invalidate()
 
     def count(self) -> int:
         return len(self._items)
@@ -158,7 +159,9 @@ class _FlowLayout(QLayout):
 
     def takeAt(self, index: int) -> QLayoutItem | None:
         if 0 <= index < len(self._items):
-            return self._items.pop(index)
+            item = self._items.pop(index)
+            self.invalidate()
+            return item
         return None
 
     def expandingDirections(self):
@@ -192,10 +195,18 @@ class _FlowLayout(QLayout):
 
         for item in self._items:
             wid = item.widget()
-            if wid is None or not wid.isVisible():
+            if wid is None:
+                continue
+            # When only testing height, include every item regardless of current
+            # visibility: newly added chips may not have been shown yet by Qt's
+            # event loop, and skipping them would yield a zero height causing the
+            # widget to collapse before the chips ever get a chance to appear.
+            if not test_only and not wid.isVisible():
                 continue
             hint = item.sizeHint()
             iw, ih = hint.width(), hint.height()
+            if iw <= 0 or ih <= 0:
+                continue
             next_x = x + iw
             if next_x > eff.right() + 1 and x > eff.x():
                 x = eff.x()
@@ -243,84 +254,96 @@ class _NodeChip(QWidget):
 
 
 class _RpcNodeList(QWidget):
-    """Flow-layout list of RPC node chips; auto-grows in height as entries are added."""
+    """Flow-layout list of RPC node chips.
+
+    Chips are positioned via direct setGeometry() calls in _reposition(),
+    bypassing Qt's deferred layout-activation mechanism (activate /
+    LayoutRequest / setGeometry on QLayout) which caused chips to appear
+    as full-width blocks until a theme switch forced a full recompute.
+    """
 
     changed = Signal()
 
+    _H_SPACING = 6
+    _V_SPACING = 4
+    _MARGIN = 2
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._flow = _FlowLayout(self, h_spacing=6, v_spacing=4)
-        self._flow.setContentsMargins(2, 2, 2, 2)
+        self._chips: list[_NodeChip] = []
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-    # ------------------------------------------------------------------
-    # Height management: resizeEvent drives height so it works regardless
-    # of whether the parent layout chain propagates hasHeightForWidth.
-    # ------------------------------------------------------------------
+        self.setFixedHeight(0)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._sync_height()
+        self._reposition()
 
-    def _sync_height(self) -> None:
-        if self.width() <= 0:
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Chips added while hidden (config load) need one deferred pass so the
+        # parent layout has assigned us a real width before we compute positions.
+        QTimer.singleShot(0, self._reposition)
+
+    def _reposition(self) -> None:
+        w = self.width()
+        if w <= 0:
             return
-        h = self._flow.heightForWidth(self.width()) if self._flow.count() > 0 else 0
+        m = self._MARGIN
+        x, y = m, m
+        line_h = 0
+        for chip in self._chips:
+            chip.ensurePolished()
+            sh = chip.sizeHint()
+            cw, ch = sh.width(), sh.height()
+            if cw <= 0 or ch <= 0:
+                continue
+            if x + cw > w - m and x > m:
+                x = m
+                y += line_h + self._V_SPACING
+                line_h = 0
+            chip.setGeometry(x, y, cw, ch)
+            x += cw + self._H_SPACING
+            line_h = max(line_h, ch)
+        h = (y + line_h + m) if self._chips else 0
         if self.height() != h:
             self.setFixedHeight(h)
             self.updateGeometry()
-
-    def hasHeightForWidth(self) -> bool:
-        return True
-
-    def heightForWidth(self, width: int) -> int:
-        return self._flow.heightForWidth(width) if self._flow.count() > 0 else 0
-
-    def sizeHint(self) -> QSize:
-        w = self.width() if self.width() > 0 else 400
-        return QSize(w, self.heightForWidth(w))
+        self.update()
 
     def add_node(self, text: str) -> None:
-        for i in range(self._flow.count()):
-            item = self._flow.itemAt(i)
-            if item and item.widget() and item.widget().property("node_text") == text:
-                return
+        if any(c.property("node_text") == text for c in self._chips):
+            return
         chip = _NodeChip(text)
         chip.setProperty("node_text", text)
         chip.delete_requested.connect(self._remove_chip)
-        self._flow.addWidget(chip)
-        # Defer height sync by one event-loop iteration so Qt has time to
-        # polish the new chip widget and produce an accurate sizeHint().
-        QTimer.singleShot(0, self._sync_height)
+        chip.setParent(self)
+        chip.ensurePolished()
+        chip.show()
+        self._chips.append(chip)
+        self._reposition()
         self.changed.emit()
 
     def _remove_chip(self, text: str) -> None:
-        for i in range(self._flow.count()):
-            item = self._flow.itemAt(i)
-            if item and item.widget() and item.widget().property("node_text") == text:
-                w = self._flow.takeAt(i).widget()
-                if w:
-                    w.hide()
-                    w.deleteLater()
-                QTimer.singleShot(0, self._sync_height)
+        for chip in self._chips:
+            if chip.property("node_text") == text:
+                self._chips.remove(chip)
+                chip.hide()
+                chip.deleteLater()
+                self._reposition()
                 self.changed.emit()
                 return
 
     def get_nodes(self) -> list[str]:
-        result = []
-        for i in range(self._flow.count()):
-            item = self._flow.itemAt(i)
-            if item and item.widget():
-                result.append(item.widget().property("node_text"))
-        return result
+        return [c.property("node_text") for c in self._chips]
 
     def clear_nodes(self) -> None:
-        while self._flow.count():
-            item = self._flow.takeAt(0)
-            if item and item.widget():
-                item.widget().deleteLater()
-        self._sync_height()
-        self.updateGeometry()
+        for chip in self._chips:
+            chip.hide()
+            chip.deleteLater()
+        self._chips.clear()
+        if self.height() != 0:
+            self.setFixedHeight(0)
+            self.updateGeometry()
 
     def set_nodes(self, nodes: list[str]) -> None:
         self.clear_nodes()
