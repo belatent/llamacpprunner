@@ -459,14 +459,22 @@ class ParamsPanel(QWidget):
         self.port_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.port_spin.setFixedWidth(72)
 
+        self.model_alias_edit = QLineEdit()
+        self.model_alias_edit.setPlaceholderText("选填")
+        self.model_alias_edit.setMinimumWidth(200)
+        self.model_alias_edit.setToolTip("模型别名（--alias），留空则不传递该参数")
+
         self.rpc_enabled_check = QCheckBox("分布式加载")
         self.rpc_enabled_check.setToolTip("启用后显示 RPC 服务器节点配置，并传递 --rpc 参数")
 
         net_layout.addWidget(QLabel("Host"))
-        net_layout.addWidget(self.host_edit, 2)
+        net_layout.addWidget(self.host_edit, 3)
         net_layout.addSpacing(8)
         net_layout.addWidget(QLabel("端口"))
         net_layout.addWidget(self.port_spin)
+        net_layout.addSpacing(8)
+        net_layout.addWidget(QLabel("模型别名"))
+        net_layout.addWidget(self.model_alias_edit, 1)
         net_layout.addSpacing(8)
         net_layout.addWidget(self.rpc_enabled_check)
         outer.addWidget(net_row)
@@ -503,9 +511,16 @@ class ParamsPanel(QWidget):
         add_layout.setContentsMargins(0, 0, 0, 0)
         add_layout.setSpacing(4)
 
+        self.rpc_clear_btn = QPushButton("清空")
+        self.rpc_clear_btn.setObjectName("rpcClearBtn")
+        self.rpc_clear_btn.setToolTip("清空所有 RPC 节点")
+        self.rpc_clear_btn.clicked.connect(self._rpc_clear_nodes)
+
         self.rpc_host_edit = QLineEdit()
         self.rpc_host_edit.setPlaceholderText("IP 地址")
         self.rpc_host_edit.setToolTip("远程 RPC 服务器的 IP 地址或主机名")
+        self.rpc_host_edit.setFixedWidth(150)
+        self.rpc_host_edit.setAlignment(Qt.AlignRight)
 
         self.rpc_port_spin = QSpinBox()
         self.rpc_port_spin.setRange(1, 65535)
@@ -517,7 +532,9 @@ class ParamsPanel(QWidget):
         self.rpc_add_btn = QPushButton("添加")
         self.rpc_add_btn.clicked.connect(self._rpc_add_node)
 
-        add_layout.addWidget(self.rpc_host_edit, 1)
+        add_layout.addWidget(self.rpc_clear_btn)
+        add_layout.addStretch(1)
+        add_layout.addWidget(self.rpc_host_edit)
         add_layout.addWidget(QLabel(":"))
         add_layout.addWidget(self.rpc_port_spin)
         add_layout.addWidget(self.rpc_add_btn)
@@ -905,6 +922,10 @@ class ParamsPanel(QWidget):
         self.rpc_node_list.add_node(f"{host}:{port}")
         self.rpc_host_edit.clear()
 
+    def _rpc_clear_nodes(self) -> None:
+        self.rpc_node_list.clear_nodes()
+        self._emit_change()
+
     # ──────────────────────────────────────────────────────────────────────────
     # Context helpers
     # ──────────────────────────────────────────────────────────────────────────
@@ -1221,6 +1242,7 @@ class ParamsPanel(QWidget):
             spec_ngram_min_hits=self.spec_ngram_min_hits_spin.value(),
             rpc_servers=self.rpc_node_list.get_nodes(),
             rpc_enabled=self.rpc_enabled_check.isChecked(),
+            model_alias=self.model_alias_edit.text().strip(),
             custom_args_enabled=self.custom_args_enabled_check.isChecked(),
             custom_args=self.custom_args_edit.text().strip(),
         )
@@ -1299,6 +1321,8 @@ class ParamsPanel(QWidget):
         self.rpc_node_list.set_nodes(config.rpc_servers)
         self.rpc_enabled_check.setChecked(config.rpc_enabled)
         self._rpc_box.setVisible(config.rpc_enabled)
+
+        self.model_alias_edit.setText(config.model_alias)
 
         self.custom_args_enabled_check.setChecked(config.custom_args_enabled)
         self.custom_args_edit.setEnabled(config.custom_args_enabled)

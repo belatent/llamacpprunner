@@ -98,6 +98,9 @@ def build_command(config: LlamaConfig) -> list[str]:
             if config.spec_ngram_min_hits != 1:
                 command.extend(["--spec-ngram-min-hits", str(config.spec_ngram_min_hits)])
 
+    if config.model_alias.strip():
+        command.extend(["--alias", config.model_alias.strip()])
+
     if config.custom_args_enabled and config.custom_args.strip():
         command.extend(shlex.split(config.custom_args))
 

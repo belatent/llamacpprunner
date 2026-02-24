@@ -60,6 +60,8 @@ class LlamaConfig:
     rpc_servers: list[str] = field(default_factory=list)
     rpc_enabled: bool = False
 
+    model_alias: str = ""
+
     custom_args_enabled: bool = True
     custom_args: str = ""
 

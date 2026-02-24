@@ -450,3 +450,21 @@ QPushButton#RpcChipDeleteBtn:hover {
     border: none;
     padding: 0px;
 }
+
+QPushButton#rpcClearBtn {
+    background: #334155;
+    border-color: #475569;
+    color: #94a3b8;
+}
+
+QPushButton#rpcClearBtn:hover {
+    background: #475569;
+    border-color: #64748b;
+    color: #e2e8f0;
+}
+
+QPushButton#rpcClearBtn:pressed {
+    background: #1e293b;
+    border-color: #334155;
+    color: #cbd5e1;
+}
