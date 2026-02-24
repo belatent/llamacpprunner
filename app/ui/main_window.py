@@ -58,7 +58,7 @@ class MainWindow(QMainWindow):
         self.log_panel = LogPanel()
 
         left_container = QWidget()
-        left_container.setMinimumWidth(810)
+        left_container.setMinimumWidth(700)
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(8, 8, 4, 8)
         left_layout.setSpacing(8)
@@ -76,7 +76,7 @@ class MainWindow(QMainWindow):
         splitter.setCollapsible(1, False)
         splitter.setStretchFactor(0, 45)
         splitter.setStretchFactor(1, 55)
-        splitter.setSizes([810, 630])
+        splitter.setSizes([700, 630])
         root.addWidget(splitter, 1)
 
         self.setCentralWidget(central)
