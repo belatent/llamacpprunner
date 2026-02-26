@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QPainter
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -24,12 +24,61 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.command_builder import build_command, build_command_preview
-from app.core.config_schema import LlamaConfig
+from app.core.config_schema import LlamaConfig, MODE_LOCAL, MODE_SSH
 from app.core.process_runner import ProcessRunner
 from app.core.profile_store import ProfileStore
+from app.core.resource_monitor import (
+    ResourceMonitor,
+    ResourceSnapshot,
+    STATUS_DEPENDENCY_MISSING,
+)
+from app.core.ssh_client import SSHConnection
+from app.core.ssh_process_runner import SSHProcessRunner
+from app.ui.dialogs.install_deps_dialog import InstallDepsDialog
 from app.ui.panels.log_panel import LogPanel
 from app.ui.panels.params_panel import ParamsPanel
 from app.ui.theme_manager import ThemeManager
+
+
+class _SSHCmdWorker(QObject):
+    """Executes a single SSH command and emits output."""
+
+    output = Signal(str)
+    finished = Signal()
+
+    def __init__(self, conn: SSHConnection, cmd: str) -> None:
+        super().__init__()
+        self._conn = conn
+        self._cmd = cmd
+
+    def run(self) -> None:
+        try:
+            exit_code, stdout, stderr = self._conn.exec_command(self._cmd)
+            if stdout.strip():
+                self.output.emit(stdout.rstrip("\n"))
+            if stderr.strip():
+                self.output.emit(stderr.rstrip("\n"))
+            if exit_code != 0:
+                self.output.emit(f"(退出码: {exit_code})")
+        except Exception as e:
+            self.output.emit(f"错误: {e}")
+        finally:
+            self.finished.emit()
+
+
+class _OverlayMask(QWidget):
+    """Semi-transparent overlay that blocks mouse input on the left panel."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.setStyleSheet("background: transparent;")
+        self.hide()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(180, 180, 180, 84))  # ~33% gray
+        painter.end()
 
 
 class MainWindow(QMainWindow):
@@ -38,7 +87,11 @@ class MainWindow(QMainWindow):
         self.app_root = Path(app_root)
         self.profile_store = ProfileStore(self.app_root)
         self.runner = ProcessRunner()
+        self.ssh_runner = SSHProcessRunner()
+        self.resource_monitor = ResourceMonitor(self)
         self.theme_mgr = theme_mgr
+        self._ssh_cmd_thread: QThread | None = None
+        self._ssh_cmd_worker: _SSHCmdWorker | None = None
         self.setWindowTitle("llama.cpp 启动器")
         self.resize(1280, 640)
         self.setMinimumSize(1280, 640)
@@ -57,9 +110,9 @@ class MainWindow(QMainWindow):
         self.params_panel = ParamsPanel()
         self.log_panel = LogPanel()
 
-        left_container = QWidget()
-        left_container.setMinimumWidth(720)
-        left_layout = QVBoxLayout(left_container)
+        self.left_container = QWidget()
+        self.left_container.setMinimumWidth(720)
+        left_layout = QVBoxLayout(self.left_container)
         left_layout.setContentsMargins(8, 8, 4, 8)
         left_layout.setSpacing(8)
 
@@ -69,8 +122,10 @@ class MainWindow(QMainWindow):
 
         left_layout.addWidget(scroll, 1)
 
+        self._overlay = _OverlayMask(self.left_container)
+
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_container)
+        splitter.addWidget(self.left_container)
         splitter.addWidget(self.log_panel)
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
@@ -86,8 +141,39 @@ class MainWindow(QMainWindow):
         self.status_indicator.setFixedSize(10, 10)
         self._set_status_indicator("stopped")
         self.status_text = QLabel("就绪")
+
+        self._resource_container = QWidget()
+        self._resource_container.setObjectName("resourceContainer")
+        res_layout = QHBoxLayout(self._resource_container)
+        res_layout.setContentsMargins(0, 0, 0, 0)
+        res_layout.setSpacing(4)
+
+        self.resource_label = QLabel()
+        self.resource_label.setObjectName("resourceLabel")
+
+        self.install_link = QLabel()
+        self.install_link.setObjectName("installLink")
+        self.install_link.setTextFormat(Qt.RichText)
+        self.install_link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.install_link.setOpenExternalLinks(False)
+        self.install_link.linkActivated.connect(self._on_install_deps_clicked)
+        self.install_link.hide()
+
+        res_layout.addStretch()
+        res_layout.addWidget(self.resource_label)
+        res_layout.addWidget(self.install_link)
+        res_layout.addStretch()
+        self._resource_container.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred
+        )
+
+        self.mode_hint_label = QLabel()
+        self.mode_hint_label.setObjectName("modeHintLabel")
+
         status.addWidget(self.status_indicator)
         status.addWidget(self.status_text)
+        status.addWidget(self._resource_container, 1)
+        status.addPermanentWidget(self.mode_hint_label)
         self.setStatusBar(status)
 
     def _build_toolbar(self) -> None:
@@ -99,6 +185,7 @@ class MainWindow(QMainWindow):
         self.start_stop_btn = QPushButton("启动")
         self.start_stop_btn.setObjectName("startStopBtn")
         self.start_stop_btn.setProperty("running", False)
+        self.start_stop_btn.setProperty("ssh_mode", False)
 
         self.open_webui_btn = QPushButton("打开WebUI")
         self.open_webui_btn.setEnabled(False)
@@ -146,6 +233,9 @@ class MainWindow(QMainWindow):
 
     def _bind_events(self) -> None:
         self.params_panel.config_changed.connect(self._on_config_changed)
+        self.params_panel.mode_changed.connect(self._on_mode_changed)
+        self.params_panel.ssh_connection_changed.connect(self._on_ssh_connection_changed)
+        self.log_panel.ssh_command_submitted.connect(self._on_ssh_command)
         self.load_btn.clicked.connect(self._load_profile_dialog)
         self.save_btn.clicked.connect(self._save_profile_dialog)
         self.save_as_btn.clicked.connect(self._save_as_profile_dialog)
@@ -155,12 +245,71 @@ class MainWindow(QMainWindow):
         self.config_dir_edit.editingFinished.connect(self._on_config_dir_changed)
         self.config_dir_browse_btn.clicked.connect(self._browse_config_dir)
 
-        self.runner.line_received.connect(self.log_panel.append_line)
-        self.runner.line_received.connect(self._on_line_received)
-        self.runner.partial_received.connect(self.log_panel.update_partial)
-        self.runner.state_changed.connect(self._on_runner_state_changed)
-        self.runner.process_started.connect(self._on_process_started)
-        self.runner.process_stopped.connect(self._on_process_stopped)
+        for r in (self.runner, self.ssh_runner):
+            r.line_received.connect(self.log_panel.append_line)
+            r.line_received.connect(self._on_line_received)
+            r.partial_received.connect(self.log_panel.update_partial)
+            r.state_changed.connect(self._on_runner_state_changed)
+            r.process_started.connect(self._on_process_started)
+            r.process_stopped.connect(self._on_process_stopped)
+
+        self._update_mode_hint()
+
+        self.resource_monitor.snapshot_ready.connect(self._on_resource_snapshot)
+
+    def _start_resource_monitor(self) -> None:
+        mode = self.params_panel.mode_combo.currentText()
+        if mode == MODE_SSH:
+            conn = self.params_panel.get_ssh_connection()
+            if not conn or not conn.is_connected:
+                self.resource_label.setText("等待连接...")
+                self.install_link.hide()
+                return
+            self.resource_monitor.start("ssh", conn)
+        else:
+            self.resource_monitor.start("local")
+
+    def _restart_resource_monitor(self) -> None:
+        self.resource_monitor.stop()
+        self.resource_label.setText("")
+        self.install_link.hide()
+        self._start_resource_monitor()
+
+    def _on_resource_snapshot(self, snap: ResourceSnapshot) -> None:
+        is_ssh = self.params_panel.mode_combo.currentText() == MODE_SSH
+
+        if snap.status == STATUS_DEPENDENCY_MISSING and is_ssh:
+            self.resource_monitor.stop()
+            self.resource_label.setText("远程设备依赖缺失，无法显示数据……")
+            self.install_link.setText(
+                '<a href="install" style="color: #6366f1; '
+                'text-decoration: underline;">安装依赖</a>'
+            )
+            self.install_link.show()
+            return
+
+        self.install_link.hide()
+        prefix = "远程" if is_ssh else "本地"
+        parts: list[str] = [prefix]
+        parts.append(f"CPU: {snap.cpu_freq_mhz}MHz/{snap.cpu_percent:.0f}%")
+        if snap.mem_total_mb:
+            parts.append(
+                f"RAM: {snap.mem_used_mb / 1024:.1f}/{snap.mem_total_mb / 1024:.1f}GB"
+            )
+        for g in snap.gpus:
+            gpu_text = f"GPU {g.index}({g.short_name}): {g.mem_used_mb / 1024:.1f}GB"
+            if g.power_w > 0:
+                gpu_text += f"/{g.power_w:.0f}W"
+            parts.append(gpu_text)
+        self.resource_label.setText(" | ".join(parts))
+
+    def _on_install_deps_clicked(self, _link: str) -> None:
+        conn = self.params_panel.get_ssh_connection()
+        if not conn or not conn.is_connected:
+            return
+        dialog = InstallDepsDialog(conn, self)
+        dialog.exec()
+        self._restart_resource_monitor()
 
     def _restore_state(self) -> None:
         state = self.profile_store.load_state()
@@ -182,6 +331,15 @@ class MainWindow(QMainWindow):
         else:
             self.params_panel.from_config(LlamaConfig())
         self._on_config_changed(self._current_config())
+        config = self._current_config()
+        if config.mode == MODE_SSH:
+            self.start_stop_btn.setProperty("ssh_mode", True)
+            self.start_stop_btn.style().unpolish(self.start_stop_btn)
+            self.start_stop_btn.style().polish(self.start_stop_btn)
+        self._update_mode_hint()
+        self._update_start_btn_enabled()
+        self._update_log_panel_ssh_state()
+        self._restart_resource_monitor()
 
     def _save_state(self) -> None:
         self.profile_store.save_state(
@@ -198,6 +356,81 @@ class MainWindow(QMainWindow):
 
     def _on_config_changed(self, config: LlamaConfig) -> None:
         self.log_panel.set_command_preview(build_command_preview(config))
+
+    def _on_mode_changed(self, mode: str) -> None:
+        self._update_mode_hint()
+        self.log_panel.clear()
+        is_ssh = mode == MODE_SSH
+        self.start_stop_btn.setProperty("ssh_mode", is_ssh)
+        self.start_stop_btn.style().unpolish(self.start_stop_btn)
+        self.start_stop_btn.style().polish(self.start_stop_btn)
+        self._update_start_btn_enabled()
+        self._update_log_panel_ssh_state()
+        self._restart_resource_monitor()
+
+    def _on_ssh_connection_changed(self, connected: bool) -> None:
+        self._update_mode_hint()
+        self._update_start_btn_enabled()
+        self._update_log_panel_ssh_state()
+        self._restart_resource_monitor()
+
+    def _update_start_btn_enabled(self) -> None:
+        """Disable start button in SSH mode when not connected."""
+        if self.runner.is_running() or self.ssh_runner.is_running():
+            return
+        is_ssh = self.params_panel.mode_combo.currentText() == MODE_SSH
+        if is_ssh:
+            conn = self.params_panel.get_ssh_connection()
+            self.start_stop_btn.setEnabled(conn is not None)
+        else:
+            self.start_stop_btn.setEnabled(True)
+
+    def _update_log_panel_ssh_state(self) -> None:
+        is_ssh = self.params_panel.mode_combo.currentText() == MODE_SSH
+        connected = False
+        if is_ssh:
+            conn = self.params_panel.get_ssh_connection()
+            connected = conn is not None
+        self.log_panel.set_ssh_mode(is_ssh, connected)
+
+    def _on_ssh_command(self, cmd: str) -> None:
+        conn = self.params_panel.get_ssh_connection()
+        if not conn:
+            return
+        self.log_panel.append_line(f"$ {cmd}")
+        self.log_panel.set_ssh_input_busy(True)
+
+        worker = _SSHCmdWorker(conn, cmd)
+        thread = QThread()
+        worker.moveToThread(thread)
+
+        worker.output.connect(lambda text: self.log_panel.append_line(text))
+        worker.finished.connect(lambda: self._on_ssh_cmd_finished(thread, worker))
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+
+        thread.started.connect(worker.run)
+        thread.start()
+        self._ssh_cmd_thread = thread
+        self._ssh_cmd_worker = worker
+
+    def _on_ssh_cmd_finished(self, thread: QThread, worker: _SSHCmdWorker) -> None:
+        self.log_panel.set_ssh_input_busy(False)
+        thread.quit()
+        thread.wait()
+        thread.deleteLater()
+        if self._ssh_cmd_thread is thread:
+            self._ssh_cmd_thread = None
+            self._ssh_cmd_worker = None
+
+    def _update_mode_hint(self) -> None:
+        if self.params_panel.mode_combo.currentText() == MODE_SSH:
+            conn = self.params_panel.get_ssh_connection()
+            if conn:
+                self.mode_hint_label.setText(f"SSH连接成功： {conn.get_connection_string()}")
+            else:
+                self.mode_hint_label.setText("SSH模式")
+        else:
+            self.mode_hint_label.setText("本地模式")
 
     def _refresh_profiles(self) -> None:
         current = self.profile_combo.currentText().strip()
@@ -283,7 +516,7 @@ class MainWindow(QMainWindow):
         self.status_text.setText(f"已加载配置：{profile_name}")
 
     def _toggle_process(self) -> None:
-        if self.runner.is_running():
+        if self.runner.is_running() or self.ssh_runner.is_running():
             self._stop_process()
         else:
             self._start_process()
@@ -296,12 +529,22 @@ class MainWindow(QMainWindow):
             return
         command = build_command(config)
         try:
-            self.runner.start(command, cwd=config.llama_dir or None)
+            if config.mode == MODE_SSH:
+                conn = self.params_panel.get_ssh_connection()
+                if not conn:
+                    QMessageBox.warning(self, "启动失败", "请先连接 SSH。")
+                    return
+                self.ssh_runner.start(conn, command, cwd=config.llama_dir or None)
+            else:
+                self.runner.start(command, cwd=config.llama_dir or None)
         except (ValueError, RuntimeError, OSError) as exc:
             QMessageBox.critical(self, "启动失败", str(exc))
 
     def _stop_process(self) -> None:
-        self.runner.stop()
+        if self.ssh_runner.is_running():
+            self.ssh_runner.stop()
+        if self.runner.is_running():
+            self.runner.stop()
 
     def _on_runner_state_changed(self, state: str) -> None:
         state_map = {
@@ -318,7 +561,10 @@ class MainWindow(QMainWindow):
 
         if state == "running":
             config = self._current_config()
-            self._webui_url = f"http://{config.host}:{config.port}"
+            if config.mode == MODE_SSH:
+                self._webui_url = f"http://{config.ssh_host}:{config.port}"
+            else:
+                self._webui_url = f"http://{config.host}:{config.port}"
         else:
             self._webui_url = ""
             self.open_webui_btn.setEnabled(False)
@@ -326,9 +572,15 @@ class MainWindow(QMainWindow):
     def _set_start_stop_running(self, running: bool) -> None:
         self.start_stop_btn.setProperty("running", running)
         self.start_stop_btn.setText("停止" if running else "启动")
+        if running:
+            self.start_stop_btn.setEnabled(True)
         # Force QSS to re-evaluate the dynamic property
         self.start_stop_btn.style().unpolish(self.start_stop_btn)
         self.start_stop_btn.style().polish(self.start_stop_btn)
+        # Show/hide overlay mask on left panel
+        self._set_left_panel_locked(running)
+        if not running:
+            self._update_start_btn_enabled()
 
     def _set_status_indicator(self, state: str) -> None:
         colors = {
@@ -369,8 +621,25 @@ class MainWindow(QMainWindow):
             self.theme_toggle_btn.setText("Dark")
             self.theme_toggle_btn.setToolTip("切换到暗黑主题")
 
+    def _set_left_panel_locked(self, locked: bool) -> None:
+        if locked:
+            self._overlay.setGeometry(self.left_container.rect())
+            self._overlay.raise_()
+            self._overlay.show()
+        else:
+            self._overlay.hide()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._overlay.isVisible():
+            self._overlay.setGeometry(self.left_container.rect())
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._save_state()
+        self.resource_monitor.stop()
+        if self.ssh_runner.is_running():
+            self.ssh_runner.stop()
         if self.runner.is_running():
             self.runner.stop(force_after_ms=500)
+        self.params_panel.disconnect_ssh()
         super().closeEvent(event)

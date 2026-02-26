@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QDoubleSpinBox,
     QFormLayout,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QLayout,
     QLayoutItem,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -26,7 +28,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.config_schema import LlamaConfig
+from app.core.config_schema import LlamaConfig, MODE_LOCAL, MODE_SSH
+from app.core.ssh_client import SSHConnection
 
 CTX_STEPS = [-1, 512, 8192, 16384, 32768, 65536, 131072]
 CTX_DEFAULT_IDX = 2  # 8192
@@ -52,7 +55,21 @@ class _LazyGpuCombo(QComboBox):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._detected = False
+        self._ssh_getter = None  # callable returning SSHConnection | None
+        self._ssh_mode = False
         self.addItem("Auto")
+
+    def set_ssh_getter(self, getter) -> None:
+        """Set a callable that returns an active SSHConnection or None."""
+        self._ssh_getter = getter
+
+    def set_ssh_mode(self, is_ssh: bool) -> None:
+        """Set whether we are in SSH mode (affects GPU detection source)."""
+        self._ssh_mode = is_ssh
+
+    def reset_detection(self) -> None:
+        """Force re-detection next time popup opens."""
+        self._detected = False
 
     def showPopup(self) -> None:
         if not self._detected:
@@ -62,7 +79,19 @@ class _LazyGpuCombo(QComboBox):
 
     def _detect_and_populate(self) -> None:
         current = self.currentText()
-        gpus = _detect_gpus()
+        gpus: list[str] = []
+        ssh_conn = self._ssh_getter() if self._ssh_getter else None
+        if self._ssh_mode:
+            if ssh_conn and ssh_conn.is_connected:
+                try:
+                    _, out, _ = ssh_conn.exec_command(
+                        "nvidia-smi --query-gpu=name --format=csv,noheader", timeout=5
+                    )
+                    gpus = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+                except Exception:
+                    gpus = []
+        else:
+            gpus = _detect_gpus()
         self.blockSignals(True)
         self.clear()
         self.addItem("Auto")
@@ -353,6 +382,8 @@ class _RpcNodeList(QWidget):
 
 class ParamsPanel(QWidget):
     config_changed = Signal(object)
+    mode_changed = Signal(str)  # Emits MODE_LOCAL or MODE_SSH
+    ssh_connection_changed = Signal(bool)  # True when connected
 
     def __init__(self) -> None:
         super().__init__()
@@ -366,6 +397,12 @@ class ParamsPanel(QWidget):
         self._ngram_group: QGroupBox | None = None
         self._ngram_params_row: QWidget | None = None
         self._draft_model_container: QWidget | None = None
+        # Mode-specific path storage: {MODE_LOCAL: {llama_dir, model_dir, model_file}, MODE_SSH: {...}}
+        self._mode_paths: dict[str, dict[str, str]] = {
+            MODE_LOCAL: {"llama_dir": "", "model_dir": "", "model_file": "", "mmproj_file": ""},
+            MODE_SSH: {"llama_dir": "", "model_dir": "", "model_file": "", "mmproj_file": ""},
+        }
+        self._ssh_connection = None  # SSHConnection when connected
         self._build_ui()
         self.from_config(LlamaConfig())
         self._bind_change_signals()
@@ -384,11 +421,92 @@ class ParamsPanel(QWidget):
         root.addWidget(self._build_path_group())
         root.addWidget(self._build_service_group())
         root.addStretch(1)
+        self._apply_mode_ui_state(self.mode_combo.currentText())
+
+    def _apply_mode_ui_state(self, mode: str) -> None:
+        """Update enable/disable state of mode-dependent widgets."""
+        is_ssh = mode == MODE_SSH
+        self.ssh_ip_edit.setEnabled(is_ssh)
+        self.ssh_port_spin.setEnabled(is_ssh)
+        self.ssh_username_edit.setEnabled(is_ssh)
+        self.ssh_password_edit.setEnabled(is_ssh)
+        self.ssh_connect_btn.setEnabled(is_ssh)
+        if is_ssh:
+            ssh_connected = self._ssh_connection is not None and self._ssh_connection.is_connected
+            self.ssh_connect_btn.setText("断开" if ssh_connected else "连接")
+        for lbl in self._ssh_labels:
+            lbl.setEnabled(is_ssh)
+        if is_ssh:
+            self.update_llamacpp_btn.setEnabled(False)
+            ssh_connected = self._ssh_connection is not None and self._ssh_connection.is_connected
+            self.llama_browse_btn.setEnabled(ssh_connected)
+            self.model_dir_browse_btn.setEnabled(ssh_connected)
+            self.model_file_refresh_btn.setEnabled(ssh_connected)
+        else:
+            has_dir = bool(self.llama_dir_edit.text().strip())
+            self.update_llamacpp_btn.setEnabled(has_dir)
+            self.llama_browse_btn.setEnabled(True)
+            self.model_dir_browse_btn.setEnabled(True)
+            self.model_file_refresh_btn.setEnabled(True)
 
     def _build_path_group(self) -> QWidget:
         group = QGroupBox("路径与模型")
         form = QFormLayout(group)
         form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        # Mode row: 模式 | IP 端口 账号 密码 连接
+        mode_row = QWidget()
+        mode_layout = QHBoxLayout(mode_row)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        mode_layout.setSpacing(4)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([MODE_LOCAL, MODE_SSH])
+        self.mode_combo.setFixedWidth(70)
+        self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
+
+        sep_label = QLabel("|")
+        sep_label.setFixedWidth(10)
+        sep_label.setAlignment(Qt.AlignCenter)
+
+        self.ssh_ip_edit = QLineEdit()
+        self.ssh_ip_edit.setMinimumWidth(60)
+
+        self.ssh_port_spin = QSpinBox()
+        self.ssh_port_spin.setRange(1, 65535)
+        self.ssh_port_spin.setValue(22)
+        self.ssh_port_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.ssh_port_spin.setFixedWidth(56)
+
+        self.ssh_username_edit = QLineEdit()
+        self.ssh_username_edit.setMinimumWidth(50)
+
+        self.ssh_password_edit = QLineEdit()
+        self.ssh_password_edit.setEchoMode(QLineEdit.Password)
+        self.ssh_password_edit.setMinimumWidth(50)
+
+        self.ssh_connect_btn = QPushButton("连接")
+        self.ssh_connect_btn.clicked.connect(self._on_ssh_connect)
+
+        self._ssh_label_ip = QLabel("IP")
+        self._ssh_label_port = QLabel("端口")
+        self._ssh_label_user = QLabel("账号")
+        self._ssh_label_pass = QLabel("密码")
+        self._ssh_labels = [sep_label, self._ssh_label_ip, self._ssh_label_port,
+                            self._ssh_label_user, self._ssh_label_pass]
+
+        mode_layout.addWidget(self.mode_combo)
+        mode_layout.addWidget(sep_label)
+        mode_layout.addWidget(self._ssh_label_ip)
+        mode_layout.addWidget(self.ssh_ip_edit, 2)
+        mode_layout.addWidget(self._ssh_label_port)
+        mode_layout.addWidget(self.ssh_port_spin)
+        mode_layout.addWidget(self._ssh_label_user)
+        mode_layout.addWidget(self.ssh_username_edit, 1)
+        mode_layout.addWidget(self._ssh_label_pass)
+        mode_layout.addWidget(self.ssh_password_edit, 1)
+        mode_layout.addWidget(self.ssh_connect_btn)
+        form.addRow("操作模式", mode_row)
 
         self.llama_dir_edit = QLineEdit()
         self.llama_dir_edit.setPlaceholderText("选择 llama.cpp 目录")
@@ -413,7 +531,7 @@ class ParamsPanel(QWidget):
         self.update_llamacpp_btn.setEnabled(False)
         self.update_llamacpp_btn.clicked.connect(self._open_update_dialog)
 
-        self.local_ver_label = QLabel("本地: —")
+        self.local_ver_label = QLabel("当前版本: —")
         self.github_ver_label = QLabel("GitHub最新: —")
 
         self.gh_refresh_btn = QPushButton("↻")
@@ -433,23 +551,47 @@ class ParamsPanel(QWidget):
         form.addRow("", llama_action_row)
 
         # Model dir (full-width line edit)
-        self.model_dir_edit, model_dir_row = self._path_row("选择模型目录", pick_dir=True)
+        self.model_dir_edit, model_dir_row, self.model_dir_browse_btn = self._path_row(
+            "选择模型目录", pick_dir=True, use_ssh_browse=True
+        )
+        form.addRow("模型目录", model_dir_row)
+
+        from PySide6.QtWidgets import QGridLayout
+
+        model_grid = QWidget()
+        grid = QGridLayout(model_grid)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(6)
+
         self.model_file_combo = QComboBox()
         self.model_file_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.mmproj_enabled_check = QCheckBox("多模态")
+        self.mmproj_enabled_check.setToolTip("启用后选择 mmproj 文件，传递 --mmproj 参数")
+        self.mmproj_file_combo = QComboBox()
+        self.mmproj_file_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.mmproj_file_combo.setEnabled(False)
+
         self.model_file_refresh_btn = QPushButton("↻")
         self.model_file_refresh_btn.setFlat(True)
-        self.model_file_refresh_btn.setFixedSize(30, 28)
-        self.model_file_refresh_btn.setToolTip("刷新模型文件列表")
+        self.model_file_refresh_btn.setFixedSize(30, 58)
+        self.model_file_refresh_btn.setToolTip("刷新模型文件和多模态文件列表")
         self.model_file_refresh_btn.setCursor(Qt.PointingHandCursor)
-        self.model_file_refresh_btn.clicked.connect(self.scan_models)
-        model_file_row = QWidget()
-        model_file_layout = QHBoxLayout(model_file_row)
-        model_file_layout.setContentsMargins(0, 0, 0, 0)
-        model_file_layout.setSpacing(6)
-        model_file_layout.addWidget(self.model_file_combo, 1)
-        model_file_layout.addWidget(self.model_file_refresh_btn)
-        form.addRow("模型目录", model_dir_row)
-        form.addRow("模型文件", model_file_row)
+        self.model_file_refresh_btn.clicked.connect(self._refresh_all_model_files)
+
+        mmproj_inner = QWidget()
+        mmproj_layout = QHBoxLayout(mmproj_inner)
+        mmproj_layout.setContentsMargins(0, 0, 0, 0)
+        mmproj_layout.setSpacing(6)
+        mmproj_layout.addWidget(self.mmproj_enabled_check)
+        mmproj_layout.addWidget(self.mmproj_file_combo, 1)
+
+        grid.addWidget(self.model_file_combo, 0, 0)
+        grid.addWidget(mmproj_inner, 1, 0)
+        grid.addWidget(self.model_file_refresh_btn, 0, 1, 2, 1)
+        grid.setColumnStretch(0, 1)
+
+        form.addRow("模型文件", model_grid)
         return group
 
     def _build_service_group(self) -> QWidget:
@@ -457,7 +599,7 @@ class ParamsPanel(QWidget):
         outer = QVBoxLayout(group)
         outer.setSpacing(8)
 
-        # ── Host + 端口 + 分布式加载 on one row ──────────────────────────────
+        # ── Row 1: Host + 端口 + 模型别名 + 选项复选框 ──────────────────────
         net_row = QWidget()
         net_layout = QHBoxLayout(net_row)
         net_layout.setContentsMargins(0, 0, 0, 0)
@@ -465,29 +607,29 @@ class ParamsPanel(QWidget):
 
         self.host_edit = QLineEdit()
         self.host_edit.setPlaceholderText("127.0.0.1")
+        self.host_edit.setFixedWidth(110)
 
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self.port_spin.setFixedWidth(72)
+        self.port_spin.setFixedWidth(60)
 
         self.model_alias_edit = QLineEdit()
         self.model_alias_edit.setPlaceholderText("选填")
-        self.model_alias_edit.setMinimumWidth(200)
         self.model_alias_edit.setToolTip("模型别名（--alias），留空则不传递该参数")
 
+        self.verbose_check = QCheckBox("verbose")
+        self.verbose_check.setToolTip("传递 --verbose 参数，输出详细日志")
         self.rpc_enabled_check = QCheckBox("分布式加载")
         self.rpc_enabled_check.setToolTip("启用后显示 RPC 服务器节点配置，并传递 --rpc 参数")
 
         net_layout.addWidget(QLabel("Host"))
-        net_layout.addWidget(self.host_edit, 3)
-        net_layout.addSpacing(8)
+        net_layout.addWidget(self.host_edit)
         net_layout.addWidget(QLabel("端口"))
         net_layout.addWidget(self.port_spin)
-        net_layout.addSpacing(8)
-        net_layout.addWidget(QLabel("模型别名"))
+        net_layout.addWidget(QLabel("别名"))
         net_layout.addWidget(self.model_alias_edit, 1)
-        net_layout.addSpacing(8)
+        net_layout.addWidget(self.verbose_check)
         net_layout.addWidget(self.rpc_enabled_check)
         outer.addWidget(net_row)
 
@@ -661,6 +803,7 @@ class ParamsPanel(QWidget):
         # Row 3: 主GPU (50%) | KV K (25%) | KV V (25%)
         kv_items = ["f16", "bf16", "f32", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"]
         self.main_gpu_combo = _LazyGpuCombo()
+        self.main_gpu_combo.set_ssh_getter(self.get_ssh_connection)
         self.kv_k_combo = QComboBox()
         self.kv_k_combo.addItems(kv_items)
         self.kv_v_combo = QComboBox()
@@ -829,7 +972,7 @@ class ParamsPanel(QWidget):
         dp_layout.addWidget(QLabel("draft-min"))
         dp_layout.addWidget(self.draft_min_spin, 1)
 
-        self.draft_model_edit, draft_model_inner = self._path_row("选择草稿模型（可选）", pick_file=True)
+        self.draft_model_edit, draft_model_inner, _ = self._path_row("选择草稿模型（可选）", pick_file=True)
         draft_model_section = QWidget()
         dms_layout = QHBoxLayout(draft_model_section)
         dms_layout.setContentsMargins(0, 0, 0, 0)
@@ -937,6 +1080,106 @@ class ParamsPanel(QWidget):
     def _rpc_clear_nodes(self) -> None:
         self.rpc_node_list.clear_nodes()
         self._emit_change()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Mode & SSH
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _on_mode_changed(self, mode: str) -> None:
+        is_ssh = mode == MODE_SSH
+
+        # Save current paths for previous mode
+        prev_mode = MODE_SSH if mode == MODE_LOCAL else MODE_LOCAL
+        self._mode_paths[prev_mode] = {
+            "llama_dir": self.llama_dir_edit.text().strip(),
+            "model_dir": self.model_dir_edit.text().strip(),
+            "model_file": self.model_file_combo.currentText().strip(),
+            "mmproj_file": self.mmproj_file_combo.currentText().strip(),
+        }
+
+        # Restore paths for new mode
+        stored = self._mode_paths.get(mode, {})
+        if stored.get("llama_dir") or stored.get("model_dir") or stored.get("model_file"):
+            self.llama_dir_edit.setText(stored.get("llama_dir", ""))
+            self.model_dir_edit.setText(stored.get("model_dir", ""))
+            self._refresh_all_model_files()
+            self.model_file_combo.setCurrentText(stored.get("model_file", ""))
+            self.mmproj_file_combo.setCurrentText(stored.get("mmproj_file", ""))
+        else:
+            self.llama_dir_edit.clear()
+            self.model_dir_edit.clear()
+            self.model_file_combo.clear()
+            self.model_file_combo.blockSignals(True)
+            self.model_file_combo.addItems([])
+            self.model_file_combo.blockSignals(False)
+            self.mmproj_file_combo.clear()
+            self.mmproj_file_combo.blockSignals(True)
+            self.mmproj_file_combo.addItems([])
+            self.mmproj_file_combo.blockSignals(False)
+
+        if is_ssh:
+            self.update_llamacpp_btn.setEnabled(False)
+        else:
+            self._on_llama_dir_changed(self.llama_dir_edit.text())
+
+        self.main_gpu_combo.set_ssh_mode(is_ssh)
+        self.main_gpu_combo.reset_detection()
+        self._apply_mode_ui_state(mode)
+        self.mode_changed.emit(mode)
+        self._emit_change()
+
+    def _on_ssh_connect(self) -> None:
+        if self._ssh_connection and self._ssh_connection.is_connected:
+            self._ssh_connection.disconnect()
+            self._ssh_connection = None
+            self.ssh_connect_btn.setText("连接")
+            self.main_gpu_combo.reset_detection()
+            self.ssh_connection_changed.emit(False)
+            self._apply_mode_ui_state(self.mode_combo.currentText())
+            return
+
+        host = self.ssh_ip_edit.text().strip()
+        if not host:
+            QMessageBox.warning(self, "SSH 连接", "请填写 IP 地址。")
+            return
+        port = self.ssh_port_spin.value()
+        username = self.ssh_username_edit.text().strip()
+        if not username:
+            QMessageBox.warning(self, "SSH 连接", "请填写账号。")
+            return
+        password = self.ssh_password_edit.text()
+
+        try:
+            conn = SSHConnection(host=host, port=port, username=username, password=password)
+            conn.connect()
+            self._ssh_connection = conn
+            self.ssh_connect_btn.setText("断开")
+            self.main_gpu_combo.reset_detection()
+            self.ssh_connection_changed.emit(True)
+            self._apply_mode_ui_state(self.mode_combo.currentText())
+            llama_dir = self.llama_dir_edit.text().strip()
+            if llama_dir:
+                self._update_local_version(llama_dir)
+            self._refresh_all_model_files()
+        except Exception as e:
+            self._ssh_connection = None
+            self._apply_mode_ui_state(self.mode_combo.currentText())
+            QMessageBox.warning(self, "SSH 连接失败", str(e))
+
+    def disconnect_ssh(self) -> None:
+        """Disconnect SSH (called on app close)."""
+        if self._ssh_connection:
+            self._ssh_connection.disconnect()
+            self._ssh_connection = None
+
+    def get_ssh_connection(self) -> SSHConnection | None:
+        """Return active SSH connection, or None."""
+        if self._ssh_connection and self._ssh_connection.is_connected:
+            return self._ssh_connection
+        return None
+
+    def is_ssh_mode(self) -> bool:
+        return self.mode_combo.currentText() == MODE_SSH
 
     # ──────────────────────────────────────────────────────────────────────────
     # Context helpers
@@ -1052,6 +1295,9 @@ class ParamsPanel(QWidget):
     def _on_custom_args_enabled_toggled(self, checked: bool) -> None:
         self.custom_args_edit.setEnabled(checked)
 
+    def _on_mmproj_enabled_toggled(self, checked: bool) -> None:
+        self.mmproj_file_combo.setEnabled(checked)
+
     def _on_rpc_enabled_toggled(self, checked: bool) -> None:
         self._rpc_box.setVisible(checked)
 
@@ -1093,19 +1339,37 @@ class ParamsPanel(QWidget):
     def _on_llama_dir_changed(self, text: str) -> None:
         llama_dir = text.strip()
         has_dir = bool(llama_dir)
-        self.update_llamacpp_btn.setEnabled(has_dir)
+        if not self.is_ssh_mode():
+            self.update_llamacpp_btn.setEnabled(has_dir)
         if has_dir:
             self._update_local_version(llama_dir)
         else:
-            self.local_ver_label.setText("本地: —")
+            self.local_ver_label.setText("当前版本: —")
 
     def _update_local_version(self, llama_dir: str) -> None:
         import re as _re
+        if self.is_ssh_mode():
+            conn = self.get_ssh_connection()
+            if not conn:
+                self.local_ver_label.setText("当前版本: —")
+                return
+            server_path = f"{llama_dir.rstrip('/')}/llama-server"
+            try:
+                code, out, err = conn.exec_command(f'"{server_path}" --version 2>&1', timeout=5)
+                output = (out + err).strip()
+                m = _re.search(r'version[:\s]+(\d+)', output, _re.IGNORECASE)
+                if m:
+                    self.local_ver_label.setText(f"当前版本: b{m.group(1)}")
+                else:
+                    self.local_ver_label.setText("当前版本: 检查失败")
+            except Exception:
+                self.local_ver_label.setText("当前版本: 检查失败")
+            return
         server_exe = Path(llama_dir) / "llama-server.exe"
         if not server_exe.exists():
             server_exe = Path(llama_dir) / "llama-server"
         if not server_exe.exists():
-            self.local_ver_label.setText("本地: 未找到")
+            self.local_ver_label.setText("当前版本: 未找到")
             return
         try:
             result = subprocess.run(
@@ -1114,10 +1378,12 @@ class ParamsPanel(QWidget):
             )
             output = (result.stdout + result.stderr).strip()
             m = _re.search(r'version[:\s]+(\d+)', output, _re.IGNORECASE)
-            version = m.group(1) if m else ("未知" if not output else output.splitlines()[0][:20])
-            self.local_ver_label.setText(f"本地: b{version}" if m else f"本地: {version}")
+            if m:
+                self.local_ver_label.setText(f"当前版本: b{m.group(1)}")
+            else:
+                self.local_ver_label.setText("当前版本: 检查失败")
         except Exception:
-            self.local_ver_label.setText("本地: 未知")
+            self.local_ver_label.setText("当前版本: 检查失败")
 
     def _fetch_github_latest(self) -> None:
         self._gh_fetch_thread = QThread()
@@ -1144,7 +1410,7 @@ class ParamsPanel(QWidget):
     # ──────────────────────────────────────────────────────────────────────────
 
     def _bind_change_signals(self) -> None:
-        _excluded = {self.rpc_host_edit, self.rpc_port_spin}
+        _excluded = {self.rpc_host_edit, self.rpc_port_spin, self.mode_combo}
 
         for widget in self.findChildren(QLineEdit):
             if widget not in _excluded:
@@ -1161,7 +1427,8 @@ class ParamsPanel(QWidget):
                 widget.currentTextChanged.connect(self._emit_change)
 
         self.llama_dir_edit.textChanged.connect(self._on_llama_dir_changed)
-        self.model_dir_edit.textChanged.connect(self.scan_models)
+        self.model_dir_edit.textChanged.connect(self._refresh_all_model_files)
+        self.mmproj_enabled_check.toggled.connect(self._on_mmproj_enabled_toggled)
         self.ctx_slider.valueChanged.connect(self._on_ctx_slider_moved)
         self.ctx_slider.valueChanged.connect(self._emit_change)
         self.rpc_node_list.changed.connect(self._emit_change)
@@ -1176,6 +1443,7 @@ class ParamsPanel(QWidget):
         self.sampling_enabled_check.toggled.connect(self._on_sampling_enabled_toggled)
         self.custom_args_enabled_check.toggled.connect(self._on_custom_args_enabled_toggled)
         self.rpc_enabled_check.toggled.connect(self._on_rpc_enabled_toggled)
+        self.verbose_check.toggled.connect(self._emit_change)
         self.speculative_enabled_check.toggled.connect(self._on_speculative_enabled_toggled)
         self.spec_ngram_enabled_check.toggled.connect(self._on_spec_ngram_enabled_toggled)
 
@@ -1186,14 +1454,32 @@ class ParamsPanel(QWidget):
     # Model scanning
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _scan_gguf_files(self) -> tuple[list[str], list[str]]:
+        """Scan model directory, returning (model_files, mmproj_files)."""
+        model_dir = self.model_dir_edit.text().strip()
+        all_files: list[str] = []
+
+        if self.is_ssh_mode():
+            conn = self.get_ssh_connection()
+            if conn and model_dir:
+                try:
+                    all_files = conn.find_gguf_files(model_dir)
+                except Exception:
+                    all_files = []
+        else:
+            p = Path(model_dir)
+            if p.exists():
+                for item in p.rglob("*.gguf"):
+                    rel = str(item.relative_to(p)).replace("\\", "/")
+                    all_files.append(rel)
+                all_files.sort(key=str.casefold)
+
+        models = [f for f in all_files if "mmproj" not in f.lower()]
+        mmproj = [f for f in all_files if "mmproj" in f.lower()]
+        return models, mmproj
+
     def scan_models(self) -> int:
-        model_dir = Path(self.model_dir_edit.text())
-        models: list[str] = []
-        if model_dir.exists():
-            for item in model_dir.rglob("*.gguf"):
-                rel = str(item.relative_to(model_dir)).replace("\\", "/")
-                models.append(rel)
-            models.sort(key=str.casefold)
+        models, _ = self._scan_gguf_files()
 
         current_model = self.model_file_combo.currentText()
         self.model_file_combo.blockSignals(True)
@@ -1204,15 +1490,54 @@ class ParamsPanel(QWidget):
         self._emit_change()
         return len(models)
 
+    def scan_mmproj(self) -> int:
+        _, mmproj = self._scan_gguf_files()
+
+        current_mmproj = self.mmproj_file_combo.currentText()
+        self.mmproj_file_combo.blockSignals(True)
+        self.mmproj_file_combo.clear()
+        self.mmproj_file_combo.addItems(mmproj)
+        self.mmproj_file_combo.setCurrentText(current_mmproj)
+        self.mmproj_file_combo.blockSignals(False)
+        self._emit_change()
+        return len(mmproj)
+
+    def _refresh_all_model_files(self) -> None:
+        """Scan once and populate both model and mmproj combos."""
+        models, mmproj = self._scan_gguf_files()
+
+        current_model = self.model_file_combo.currentText()
+        self.model_file_combo.blockSignals(True)
+        self.model_file_combo.clear()
+        self.model_file_combo.addItems(models)
+        self.model_file_combo.setCurrentText(current_model)
+        self.model_file_combo.blockSignals(False)
+
+        current_mmproj = self.mmproj_file_combo.currentText()
+        self.mmproj_file_combo.blockSignals(True)
+        self.mmproj_file_combo.clear()
+        self.mmproj_file_combo.addItems(mmproj)
+        self.mmproj_file_combo.setCurrentText(current_mmproj)
+        self.mmproj_file_combo.blockSignals(False)
+
+        self._emit_change()
+
     # ──────────────────────────────────────────────────────────────────────────
     # Config serialization
     # ──────────────────────────────────────────────────────────────────────────
 
     def to_config(self) -> LlamaConfig:
         return LlamaConfig(
+            mode=self.mode_combo.currentText(),
+            ssh_host=self.ssh_ip_edit.text().strip(),
+            ssh_port=self.ssh_port_spin.value(),
+            ssh_username=self.ssh_username_edit.text().strip(),
+            ssh_password=self.ssh_password_edit.text(),
             llama_dir=self.llama_dir_edit.text().strip(),
             model_dir=self.model_dir_edit.text().strip(),
             model_file=self.model_file_combo.currentText().strip(),
+            mmproj_enabled=self.mmproj_enabled_check.isChecked(),
+            mmproj_file=self.mmproj_file_combo.currentText().strip(),
             host=self.host_edit.text().strip() or "127.0.0.1",
             port=self.port_spin.value(),
             parallel=self.parallel_spin.value(),
@@ -1254,6 +1579,7 @@ class ParamsPanel(QWidget):
             spec_ngram_min_hits=self.spec_ngram_min_hits_spin.value(),
             rpc_servers=self.rpc_node_list.get_nodes(),
             rpc_enabled=self.rpc_enabled_check.isChecked(),
+            verbose=self.verbose_check.isChecked(),
             model_alias=self.model_alias_edit.text().strip(),
             custom_args_enabled=self.custom_args_enabled_check.isChecked(),
             custom_args=self.custom_args_edit.text().strip(),
@@ -1262,10 +1588,30 @@ class ParamsPanel(QWidget):
     def from_config(self, config: LlamaConfig) -> None:
         self._loaded_cache_ram_mib = config.cache_ram_mib
 
+        self.mode_combo.blockSignals(True)
+        mode = config.mode if config.mode in (MODE_LOCAL, MODE_SSH) else MODE_LOCAL
+        self.mode_combo.setCurrentText(mode)
+        self.mode_combo.blockSignals(False)
+
+        self.ssh_ip_edit.setText(config.ssh_host)
+        self.ssh_port_spin.setValue(config.ssh_port)
+        self.ssh_username_edit.setText(config.ssh_username)
+        self.ssh_password_edit.setText(config.ssh_password or "")
+
+        self._mode_paths[mode] = {
+            "llama_dir": config.llama_dir,
+            "model_dir": config.model_dir,
+            "model_file": config.model_file,
+            "mmproj_file": config.mmproj_file,
+        }
+
         self.llama_dir_edit.setText(config.llama_dir)
         self.model_dir_edit.setText(config.model_dir)
-        self.scan_models()
+        self._refresh_all_model_files()
         self.model_file_combo.setCurrentText(config.model_file)
+        self.mmproj_enabled_check.setChecked(config.mmproj_enabled)
+        self.mmproj_file_combo.setEnabled(config.mmproj_enabled)
+        self.mmproj_file_combo.setCurrentText(config.mmproj_file)
 
         self.host_edit.setText(config.host)
         self.port_spin.setValue(config.port)
@@ -1333,12 +1679,18 @@ class ParamsPanel(QWidget):
         self.rpc_node_list.set_nodes(config.rpc_servers)
         self.rpc_enabled_check.setChecked(config.rpc_enabled)
         self._rpc_box.setVisible(config.rpc_enabled)
+        self.verbose_check.setChecked(config.verbose)
 
         self.model_alias_edit.setText(config.model_alias)
 
         self.custom_args_enabled_check.setChecked(config.custom_args_enabled)
         self.custom_args_edit.setEnabled(config.custom_args_enabled)
         self.custom_args_edit.setText(config.custom_args)
+
+        self.main_gpu_combo.set_ssh_mode(mode == MODE_SSH)
+        self._apply_mode_ui_state(mode)
+        if mode == MODE_LOCAL and config.llama_dir:
+            self._on_llama_dir_changed(config.llama_dir)
 
         self._emit_change()
 
@@ -1354,7 +1706,13 @@ class ParamsPanel(QWidget):
             return text.split(":")[0].strip()
         return text
 
-    def _path_row(self, placeholder: str, pick_dir: bool = False, pick_file: bool = False) -> tuple[QLineEdit, QWidget]:
+    def _path_row(
+        self,
+        placeholder: str,
+        pick_dir: bool = False,
+        pick_file: bool = False,
+        use_ssh_browse: bool = False,
+    ) -> tuple[QLineEdit, QWidget, QPushButton]:
         container = QWidget()
         row = QHBoxLayout(container)
         row.setContentsMargins(0, 0, 0, 0)
@@ -1365,6 +1723,16 @@ class ParamsPanel(QWidget):
         button = QPushButton("浏览")
 
         def _pick() -> None:
+            if use_ssh_browse and self.is_ssh_mode():
+                conn = self.get_ssh_connection()
+                if not conn:
+                    QMessageBox.warning(self, "SSH 浏览", "请先连接 SSH。")
+                    return
+                from app.ui.dialogs.ssh_browse_dialog import SSHBrowseDialog
+                d = SSHBrowseDialog(self, conn, line_edit.text() or "/", pick_dir=pick_dir)
+                if d.exec() == QDialog.DialogCode.Accepted:
+                    line_edit.setText(d.selected_path())
+                return
             selected = ""
             if pick_dir:
                 selected = QFileDialog.getExistingDirectory(self, "选择目录", line_edit.text() or str(Path.home()))
@@ -1376,9 +1744,19 @@ class ParamsPanel(QWidget):
         button.clicked.connect(_pick)
         row.addWidget(line_edit, 1)
         row.addWidget(button)
-        return line_edit, container
+        return line_edit, container, button
 
     def _pick_llama_dir(self) -> None:
+        if self.is_ssh_mode():
+            conn = self.get_ssh_connection()
+            if not conn:
+                QMessageBox.warning(self, "SSH 浏览", "请先连接 SSH。")
+                return
+            from app.ui.dialogs.ssh_browse_dialog import SSHBrowseDialog
+            d = SSHBrowseDialog(self, conn, self.llama_dir_edit.text() or "/", pick_dir=True)
+            if d.exec() == QDialog.DialogCode.Accepted:
+                self.llama_dir_edit.setText(d.selected_path())
+            return
         selected = QFileDialog.getExistingDirectory(
             self, "选择 llama.cpp 目录", self.llama_dir_edit.text() or str(Path.home())
         )

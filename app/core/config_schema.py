@@ -5,11 +5,23 @@ from pathlib import Path
 from typing import Any
 
 
+MODE_LOCAL = "本地"
+MODE_SSH = "SSH"
+
+
 @dataclass
 class LlamaConfig:
+    mode: str = MODE_LOCAL
+    ssh_host: str = ""
+    ssh_port: int = 22
+    ssh_username: str = ""
+    ssh_password: str = ""  # Not persisted to disk
+
     llama_dir: str = ""
     model_dir: str = ""
     model_file: str = ""
+    mmproj_enabled: bool = False
+    mmproj_file: str = ""
 
     host: str = "127.0.0.1"
     port: int = 8080
@@ -59,6 +71,7 @@ class LlamaConfig:
 
     rpc_servers: list[str] = field(default_factory=list)
     rpc_enabled: bool = False
+    verbose: bool = False
 
     model_alias: str = ""
 
@@ -67,14 +80,19 @@ class LlamaConfig:
 
     def validate(self) -> list[str]:
         errors: list[str] = []
-        if self.llama_dir and not Path(self.llama_dir).exists():
-            errors.append("Llama 目录不存在。")
-        if self.model_dir and not Path(self.model_dir).exists():
-            errors.append("模型目录不存在。")
-        if self.model_file and self.model_dir:
-            model_path = Path(self.model_dir) / self.model_file
-            if not model_path.exists():
-                errors.append("模型文件不存在。")
+        is_ssh = self.mode == MODE_SSH
+        if not is_ssh:
+            if self.llama_dir and not Path(self.llama_dir).exists():
+                errors.append("Llama 目录不存在。")
+            if self.model_dir and not Path(self.model_dir).exists():
+                errors.append("模型目录不存在。")
+            if self.model_file and self.model_dir:
+                model_path = Path(self.model_dir) / self.model_file
+                if not model_path.exists():
+                    errors.append("模型文件不存在。")
+        if is_ssh:
+            if not self.ssh_host.strip():
+                errors.append("SSH 模式请填写 IP 并连接。")
         if not (1 <= self.port <= 65535):
             errors.append("端口范围必须在 1~65535。")
         if self.parallel < 1:
@@ -107,7 +125,9 @@ class LlamaConfig:
         return errors
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("ssh_password", None)  # Never persist password
+        return d
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "LlamaConfig":

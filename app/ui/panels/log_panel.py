@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFontDatabase, QTextCursor, QTextOption
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QFontDatabase, QKeyEvent, QTextCursor, QTextOption
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 MAX_BLOCK_COUNT = 10_000
 FLUSH_INTERVAL_MS = 50
 PREVIEW_MIN_HEIGHT = 38
+MAX_SSH_HISTORY = 200
 
 
 class _AutoHeightTextEdit(QTextEdit):
@@ -86,7 +87,45 @@ class _AutoHeightTextEdit(QTextEdit):
         self.setFixedHeight(max(PREVIEW_MIN_HEIGHT, h + overhead))
 
 
+class _HistoryLineEdit(QLineEdit):
+    """QLineEdit with Up/Down arrow command history."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._history: list[str] = []
+        self._idx = -1
+        self._draft = ""
+
+    def add_to_history(self, cmd: str) -> None:
+        if cmd and (not self._history or self._history[-1] != cmd):
+            self._history.append(cmd)
+            if len(self._history) > MAX_SSH_HISTORY:
+                self._history = self._history[-MAX_SSH_HISTORY:]
+        self._idx = -1
+        self._draft = ""
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key_Up and self._history:
+            if self._idx < len(self._history) - 1:
+                if self._idx == -1:
+                    self._draft = self.text()
+                self._idx += 1
+                self.setText(self._history[-(self._idx + 1)])
+            return
+        if event.key() == Qt.Key_Down:
+            if self._idx > 0:
+                self._idx -= 1
+                self.setText(self._history[-(self._idx + 1)])
+            elif self._idx == 0:
+                self._idx = -1
+                self.setText(self._draft)
+            return
+        super().keyPressEvent(event)
+
+
 class LogPanel(QWidget):
+    ssh_command_submitted = Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setMinimumWidth(440)
@@ -118,6 +157,8 @@ class LogPanel(QWidget):
 
         root.addWidget(self.output_edit, 1)
 
+        self._build_ssh_input(root, fixed_font)
+
     def _build_command_preview(self, parent_layout: QVBoxLayout) -> None:
         preview_label = QLabel("命令预览")
         self.preview_edit = _AutoHeightTextEdit()
@@ -143,6 +184,54 @@ class LogPanel(QWidget):
         toolbar.addWidget(self.clear_btn)
         toolbar.addWidget(self.save_btn)
         parent_layout.addLayout(toolbar)
+
+    def _build_ssh_input(self, parent_layout: QVBoxLayout, font) -> None:
+        self.ssh_input_row = QWidget()
+        row = QHBoxLayout(self.ssh_input_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        prompt = QLabel("$")
+        prompt.setFont(font)
+        self.ssh_input = _HistoryLineEdit()
+        self.ssh_input.setFont(font)
+        self.ssh_input.setPlaceholderText("输入命令，回车发送…")
+        self.ssh_input.returnPressed.connect(self._submit_ssh_command)
+
+        row.addWidget(prompt)
+        row.addWidget(self.ssh_input, 1)
+
+        self.ssh_input_row.setVisible(False)
+        parent_layout.addWidget(self.ssh_input_row)
+
+    def _submit_ssh_command(self) -> None:
+        cmd = self.ssh_input.text().strip()
+        if not cmd:
+            return
+        self.ssh_input.add_to_history(cmd)
+        self.ssh_input.clear()
+        self.ssh_command_submitted.emit(cmd)
+
+    def set_ssh_mode(self, is_ssh: bool, connected: bool) -> None:
+        """Control log panel state for SSH mode."""
+        self.ssh_input_row.setVisible(is_ssh)
+        if is_ssh:
+            self.output_edit.setEnabled(connected)
+            self.ssh_input.setEnabled(connected)
+            self.filter_edit.setEnabled(connected)
+            self.clear_btn.setEnabled(connected)
+            self.save_btn.setEnabled(connected)
+            self.auto_scroll_check.setEnabled(connected)
+        else:
+            self.output_edit.setEnabled(True)
+            self.filter_edit.setEnabled(True)
+            self.clear_btn.setEnabled(True)
+            self.save_btn.setEnabled(True)
+            self.auto_scroll_check.setEnabled(True)
+
+    def set_ssh_input_busy(self, busy: bool) -> None:
+        """Disable input while a command is executing."""
+        self.ssh_input.setEnabled(not busy)
 
     def set_command_preview(self, text: str) -> None:
         self.preview_edit.setPlainText(text)

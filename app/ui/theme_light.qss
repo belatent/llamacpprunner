@@ -66,6 +66,10 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabl
     border-color: #e2e8f0;
 }
 
+QLabel:disabled {
+    color: #c0c9d6;
+}
+
 QPlainTextEdit, QTextEdit {
     border: 1px solid #cbd5e1;
     border-radius: 6px;
@@ -214,6 +218,45 @@ QPushButton#startStopBtn[running="true"]:pressed {
     border-color: #b91c1c;
 }
 
+/* SSH mode: bright blue start, orange stop */
+QPushButton#startStopBtn[ssh_mode="true"] {
+    background: #3b82f6;
+    border-color: #3b82f6;
+    color: #ffffff;
+}
+
+QPushButton#startStopBtn[ssh_mode="true"]:hover {
+    background: #60a5fa;
+    border-color: #60a5fa;
+}
+
+QPushButton#startStopBtn[ssh_mode="true"]:pressed {
+    background: #2563eb;
+    border-color: #2563eb;
+}
+
+QPushButton#startStopBtn[ssh_mode="true"]:disabled {
+    background: #cbd5e1;
+    border-color: #cbd5e1;
+    color: #94a3b8;
+}
+
+QPushButton#startStopBtn[ssh_mode="true"][running="true"] {
+    background: #ea580c;
+    border-color: #ea580c;
+    color: #ffffff;
+}
+
+QPushButton#startStopBtn[ssh_mode="true"][running="true"]:hover {
+    background: #f97316;
+    border-color: #f97316;
+}
+
+QPushButton#startStopBtn[ssh_mode="true"][running="true"]:pressed {
+    background: #c2410c;
+    border-color: #c2410c;
+}
+
 /* ---------- CheckBox ---------- */
 QCheckBox {
     spacing: 6px;
@@ -324,6 +367,21 @@ QStatusBar {
     padding: 2px 8px;
     font-size: 12px;
     color: #64748b;
+}
+
+QLabel#modeHintLabel {
+    color: #000000;
+    font-weight: 500;
+}
+
+QLabel#resourceLabel {
+    color: #475569;
+    font-size: 12px;
+    font-family: "Consolas", "Cascadia Mono", monospace;
+}
+
+QLabel#installLink {
+    font-size: 12px;
 }
 
 /* ---------- ProgressBar ---------- */

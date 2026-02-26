@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import shlex
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from app.core.config_schema import LlamaConfig
+from app.core.config_schema import LlamaConfig, MODE_SSH
 
 
-def _resolve_executable(llama_dir: str) -> str:
+def _posix_path(*parts: str) -> str:
+    """Join path parts using POSIX forward-slash separators."""
+    return str(PurePosixPath(*parts))
+
+
+def _resolve_executable(llama_dir: str, for_linux: bool = False) -> str:
+    if for_linux:
+        base = PurePosixPath(llama_dir) if llama_dir else PurePosixPath(".")
+        return str(base / "llama-server")
     base = Path(llama_dir) if llama_dir else Path(".")
     candidates = (
         base / "llama-server.exe",
@@ -22,13 +30,27 @@ def _resolve_executable(llama_dir: str) -> str:
 
 
 def build_command(config: LlamaConfig) -> list[str]:
-    model_path = str(Path(config.model_dir) / config.model_file) if config.model_file else ""
-    command: list[str] = [_resolve_executable(config.llama_dir)]
+    for_linux = config.mode == MODE_SSH
+    if for_linux:
+        model_path = _posix_path(config.model_dir, config.model_file) if config.model_file else ""
+    else:
+        model_path = str(Path(config.model_dir) / config.model_file) if config.model_file else ""
+    command: list[str] = [_resolve_executable(config.llama_dir, for_linux=for_linux)]
 
     if model_path:
         command.extend(["-m", model_path])
 
-    command.extend(["--host", config.host, "--port", str(config.port)])
+    if config.mmproj_enabled and config.mmproj_file:
+        if for_linux:
+            mmproj_path = _posix_path(config.model_dir, config.mmproj_file)
+        else:
+            mmproj_path = str(Path(config.model_dir) / config.mmproj_file)
+        command.extend(["--mmproj", mmproj_path])
+
+    host = config.host
+    if for_linux:
+        host = "0.0.0.0"  # Remote server must listen on all interfaces for SSH access
+    command.extend(["--host", host, "--port", str(config.port)])
     if config.parallel_enabled:
         command.extend(["-np", str(config.parallel)])
 
@@ -98,6 +120,9 @@ def build_command(config: LlamaConfig) -> list[str]:
             if config.spec_ngram_min_hits != 1:
                 command.extend(["--spec-ngram-min-hits", str(config.spec_ngram_min_hits)])
 
+    if config.verbose:
+        command.append("--verbose")
+
     if config.model_alias.strip():
         command.extend(["--alias", config.model_alias.strip()])
 
@@ -107,6 +132,12 @@ def build_command(config: LlamaConfig) -> list[str]:
     return command
 
 
+def _cmd_to_string(parts: list[str], for_linux: bool) -> str:
+    if for_linux:
+        return " ".join(shlex.quote(p) for p in parts)
+    return subprocess.list2cmdline(parts)
+
+
 def build_command_preview(config: LlamaConfig) -> str:
     """Return a human-readable command string.
 
@@ -114,11 +145,10 @@ def build_command_preview(config: LlamaConfig) -> str:
     are preserved in the preview instead of being lost through
     shlex.split → list2cmdline round-tripping.
     """
+    for_linux = config.mode == MODE_SSH
     base_command = build_command(config)
-    # Remove the already-split custom args from the list so we can re-append
-    # the raw string, preserving the user's original quoting.
     if config.custom_args_enabled and config.custom_args.strip():
         extra = shlex.split(config.custom_args)
         base_command = base_command[: len(base_command) - len(extra)]
-        return subprocess.list2cmdline(base_command) + " " + config.custom_args.strip()
-    return subprocess.list2cmdline(base_command)
+        return _cmd_to_string(base_command, for_linux) + " " + config.custom_args.strip()
+    return _cmd_to_string(base_command, for_linux)
