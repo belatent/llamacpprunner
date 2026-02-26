@@ -436,8 +436,20 @@ class ParamsPanel(QWidget):
         self.model_dir_edit, model_dir_row = self._path_row("选择模型目录", pick_dir=True)
         self.model_file_combo = QComboBox()
         self.model_file_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.model_file_refresh_btn = QPushButton("↻")
+        self.model_file_refresh_btn.setFlat(True)
+        self.model_file_refresh_btn.setFixedSize(30, 28)
+        self.model_file_refresh_btn.setToolTip("刷新模型文件列表")
+        self.model_file_refresh_btn.setCursor(Qt.PointingHandCursor)
+        self.model_file_refresh_btn.clicked.connect(self.scan_models)
+        model_file_row = QWidget()
+        model_file_layout = QHBoxLayout(model_file_row)
+        model_file_layout.setContentsMargins(0, 0, 0, 0)
+        model_file_layout.setSpacing(6)
+        model_file_layout.addWidget(self.model_file_combo, 1)
+        model_file_layout.addWidget(self.model_file_refresh_btn)
         form.addRow("模型目录", model_dir_row)
-        form.addRow("模型文件", self.model_file_combo)
+        form.addRow("模型文件", model_file_row)
         return group
 
     def _build_service_group(self) -> QWidget:
