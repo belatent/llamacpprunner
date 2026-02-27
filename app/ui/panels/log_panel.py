@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -20,7 +21,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-MAX_BLOCK_COUNT = 10_000
+MAX_BLOCK_COUNT = 50_000
+MAX_LINE_STORAGE = 100_000
 FLUSH_INTERVAL_MS = 50
 PREVIEW_MIN_HEIGHT = 38
 MAX_SSH_HISTORY = 200
@@ -129,7 +131,7 @@ class LogPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setMinimumWidth(440)
-        self._lines: list[str] = []
+        self._lines: deque[str] = deque(maxlen=MAX_LINE_STORAGE)
         self._pending: list[str] = []
         self._pending_partial: str = ""
         self._displayed_partial: str = ""

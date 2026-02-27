@@ -564,7 +564,7 @@ class MainWindow(QMainWindow):
             if config.mode == MODE_SSH:
                 self._webui_url = f"http://{config.ssh_host}:{config.port}"
             else:
-                self._webui_url = f"http://{config.host}:{config.port}"
+                self._webui_url = f"http://127.0.0.1:{config.port}"
         else:
             self._webui_url = ""
             self.open_webui_btn.setEnabled(False)
